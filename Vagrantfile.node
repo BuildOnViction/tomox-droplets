@@ -1,0 +1,83 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+require 'json'
+
+appConfig = JSON.parse(File.read('config.json'))
+nodes = appConfig['nodes']
+sshKeys =  appConfig['sshKeys']
+
+Vagrant.configure('2') do |config|
+
+    nodes.each do |node|
+        config.vm.define node['name'] do |config|
+            envFile = '.env.' + node['name']
+            sshKeysFile = '.sshKeys.' + node['name']
+            f = File.new(envFile, 'w')
+            f.write('MAIN_IP=' + appConfig['mainPublicIp'] + "\n")
+            f.write('NETWORK_ID=' + appConfig['networkId'].to_s + "\n")
+            f.write('TOMOMASTER=http://' + appConfig['mainPublicIp'] + ':3001' + "\n")
+            f.write('RPC_URL=http://' + appConfig['mainPublicIp'] + ':8545' + "\n")
+            f.write('OWNER_PRIVATE_KEY=' + node['ownerPrivateKey'] + "\n")
+            f.write('COINBASE_PRIVATE_KEY=' + node['coinbasePrivateKey'] + "\n")
+            f.write('COINBASE_ADDRESS=' + node['coinbaseAddress'] + "\n")
+            f.write('NODE_NAME=' + node['name'] + "\n")
+            f.write('VERBOSITY=' + appConfig['verbosity'].to_s + "\n")
+            f.write('RESIGN_BLOCK_NUMBER=' + node['resignBlockNumber'].to_s + "\n")
+            f.write('GIT_REPO=' + appConfig['gitRepo'].to_s + "\n")
+            f.write('GIT_BRAND=' + appConfig['gitBrand'].to_s + "\n")
+            f.close    
+            f = File.new(sshKeysFile, 'w')
+            sshKeys.each do |sshKey|
+                f.write(sshKey + "\n")
+            end
+            f.write("\n")
+            f.close    
+            config.vm.provider :digital_ocean do |provider, override|
+                override.ssh.private_key_path = appConfig['privateKeyPath']
+                override.vm.box = 'digital_ocean'
+                override.vm.box_url = "https://github.com/devopsgroup-io/vagrant-digitalocean/raw/master/box/digital_ocean.box"
+                override.nfs.functional = false
+                provider.ssh_key_name = appConfig['sshKeyName']
+                provider.token = appConfig['doApiToken']
+                provider.image = 'ubuntu-18-04-x64'
+                provider.region = node['region']
+                provider.size = '8gb'
+            end
+
+            config.vm.synced_folder ".", "/vagrant", type: "rsync",
+                rsync__exclude: [ ".git/", ".env*", ".sshKeys*" ]
+
+            config.vm.provision "file", source: envFile, destination: "/vagrant/.env"
+            config.vm.provision "file", source: sshKeysFile, destination: "/vagrant/.sshKeys"
+
+            config.vm.provision "shell", inline: <<-SHELL
+                apt-get update && apt-get install -y build-essential git wget unzip
+                wget https://dl.google.com/go/go1.11.1.linux-amd64.tar.gz && tar -xvf go1.11.1.linux-amd64.tar.gz && mv go /usr/local
+                export PATH=$PATH:/usr/local/go/bin 
+                echo "export PATH=$PATH:/usr/local/go/bin" >> /root/.bashrc
+                mkdir -p ${HOME}/go/src/github.com/ethereum/
+                cd /vagrant && source .env && cd ${HOME}/go/src/github.com/ethereum/ && git clone ${GIT_REPO} go-ethereum && cd go-ethereum && git checkout origin/${GIT_BRAND}
+                cd ${HOME}/go/src/github.com/ethereum/go-ethereum && make tomo
+
+                (crontab -u root -l; echo "*/2 * * * * bash /vagrant/apply.sh >> /vagrant/apply.log 2>&1" ) | crontab -u root -
+                (crontab -u root -l; echo "*/2 * * * * bash /vagrant/resign.sh >> /vagrant/resign.log 2>&1" ) | crontab -u root -
+                (crontab -u root -l; echo "*/2 * * * * bash /vagrant/healthcheck.sh >> /vagrant/healthcheck.log 2>&1" ) | crontab -u root -
+                (crontab -u root -l; echo "*/10 * * * * bash /vagrant/vote.sh >> /vagrant/vote.log 2>&1" ) | crontab -u root -
+                (crontab -u root -l; echo "*/15 * * * * bash /vagrant/unvote.sh >> /vagrant/unvote.log 2>&1" ) | crontab -u root -
+
+                cd /tmp && wget https://releases.hashicorp.com/consul/1.4.0/consul_1.4.0_linux_amd64.zip && unzip consul_1.4.0_linux_amd64.zip && chmod +x consul && mv consul /usr/bin/consul
+                cd /vagrant && source .env
+                nohup consul watch -http-addr=${MAIN_IP}:8500 -type=key -key=tomochain/reset "bash reset.sh"<&- &>/vagrant/consul_watch.log &
+
+                cd /vagrant
+                nohup bash ./node.sh<&- &>/vagrant/node.log &
+
+                HOST_IP=`ifconfig | grep 'inet' | grep -v inet6 | grep -v '127.0.0.1' | grep -v 'broadcast 172.*.255.255' | awk '{ print $2}'`
+                consul kv put -http-addr=${MAIN_IP}:8500 tomochain/${HOST_IP} 1
+                cat .sshKeys >> ~/.ssh/authorized_keys
+
+            SHELL
+
+        end
+    end
+end
